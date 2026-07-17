@@ -1,13 +1,48 @@
 local lib_smtp = require "lib_smtp"
 
+local function cloneTable(source, visited)
+    if type(source) ~= "table" then
+        return source
+    end
+    visited = visited or {}
+    if visited[source] then
+        return visited[source]
+    end
+
+    local result = {}
+    visited[source] = result
+    for k, v in pairs(source) do
+        result[cloneTable(k, visited)] = cloneTable(v, visited)
+    end
+    return result
+end
+
 local function urlencodeTab(params)
     local msg = {}
     for k, v in pairs(params) do
-        table.insert(msg, string.urlEncode(k) .. "=" .. string.urlEncode(v))
+        if type(v) == "table" then
+            return nil, "application/x-www-form-urlencoded 不支持嵌套 table"
+        end
+        if type(k) ~= "string" and type(k) ~= "number" then
+            return nil, "application/x-www-form-urlencoded 的字段名必须是字符串或数字"
+        end
+        if type(v) ~= "string" and type(v) ~= "number" and type(v) ~= "boolean" then
+            return nil, "application/x-www-form-urlencoded 的字段值必须是字符串、数字或布尔值"
+        end
+        table.insert(msg, string.urlEncode(tostring(k)) .. "=" .. string.urlEncode(tostring(v)))
         table.insert(msg, "&")
     end
     table.remove(msg)
     return table.concat(msg)
+end
+
+local function findHeader(headers, name)
+    local normalized_name = string.lower(name)
+    for k, v in pairs(headers) do
+        if type(k) == "string" and string.lower(k) == normalized_name then
+            return k, v
+        end
+    end
 end
 
 return {
@@ -22,29 +57,91 @@ return {
             return
         end
 
-        local header = { ["content-type"] = config.CUSTOM_POST_CONTENT_TYPE }
-        local body = json.decode(json.encode(config.CUSTOM_POST_BODY_TABLE))
+        if config.CUSTOM_POST_HEADERS ~= nil and type(config.CUSTOM_POST_HEADERS) ~= "table" then
+            log.error("util_notify", "`config.CUSTOM_POST_HEADERS` 必须是 table")
+            return
+        end
+
+        local header = cloneTable(config.CUSTOM_POST_HEADERS or {})
+        for k, v in pairs(header) do
+            if type(k) ~= "string" then
+                log.error("util_notify", "`config.CUSTOM_POST_HEADERS` 的字段名必须是字符串")
+                return
+            end
+            if type(v) ~= "string" and type(v) ~= "number" and type(v) ~= "boolean" then
+                log.error("util_notify", "`config.CUSTOM_POST_HEADERS` 的字段值必须是字符串、数字或布尔值", k)
+                return
+            end
+            header[k] = tostring(v)
+        end
+        local content_type_key, content_type = findHeader(header, "content-type")
+        if content_type == nil or content_type == "" then
+            content_type = config.CUSTOM_POST_CONTENT_TYPE
+        end
+        if content_type == nil or content_type == "" then
+            content_type = "application/x-www-form-urlencoded"
+        end
+        content_type = tostring(content_type)
+        if content_type_key then
+            header[content_type_key] = content_type
+        else
+            header["Content-Type"] = content_type
+        end
+
+        local body = cloneTable(config.CUSTOM_POST_BODY_TABLE)
         -- 遍历并替换其中的变量
-        local function traverse_and_replace(t)
+        local function traverse_and_replace(t, visited)
+            visited = visited or {}
+            if visited[t] then
+                return
+            end
+            visited[t] = true
             for k, v in pairs(t) do
                 if type(v) == "table" then
-                    traverse_and_replace(v)
+                    traverse_and_replace(v, visited)
                 elseif type(v) == "string" then
-                    t[k] = string.gsub(v, "{msg}", msg)
+                    -- 使用函数作为替换值，避免通知内容中的 `%` 被 gsub 当作捕获引用。
+                    t[k] = string.gsub(v, "{msg}", function()
+                        return msg
+                    end)
                 end
             end
         end
         traverse_and_replace(body)
 
         -- 根据 content-type 进行编码, 默认为 application/x-www-form-urlencoded
-        if string.find(config.CUSTOM_POST_CONTENT_TYPE, "json") then
-            body = json.encode(body)
+        if string.find(string.lower(content_type), "json", 1, true) then
+            local encode_ok, encoded_body = pcall(json.encode, body)
+            if not encode_ok or type(encoded_body) ~= "string" then
+                log.error("util_notify", "`config.CUSTOM_POST_BODY_TABLE` JSON 编码失败")
+                return
+            end
+            body = encoded_body
         else
-            body = urlencodeTab(body)
+            local encode_error
+            body, encode_error = urlencodeTab(body)
+            if body == nil then
+                log.error("util_notify", encode_error)
+                return
+            end
         end
 
-        log.info("util_notify", "POST", config.CUSTOM_POST_URL, config.CUSTOM_POST_CONTENT_TYPE, body)
-        return util_http.fetch(nil, "POST", config.CUSTOM_POST_URL, header, body)
+        -- URL 可能包含 webhook token，body 可能包含短信正文，避免写入日志。
+        log.info("util_notify", "POST", "custom_post", content_type)
+        local res_code, res_headers, res_body = util_http.fetch(nil, "POST", config.CUSTOM_POST_URL, header, body)
+
+        -- 有些接口在 HTTP 2xx 中通过响应正文表达业务失败，可按需配置成功关键字。
+        local success_keyword = config.CUSTOM_POST_SUCCESS_BODY_KEYWORD
+        if type(res_code) == "number"
+            and res_code >= 200
+            and res_code < 300
+            and type(success_keyword) == "string"
+            and success_keyword ~= ""
+            and (type(res_body) ~= "string" or not string.find(res_body, success_keyword, 1, true)) then
+            log.error("util_notify", "custom_post 响应正文未包含成功关键字", "code:", res_code)
+            return res_code, res_headers, res_body, true
+        end
+        return res_code, res_headers, res_body
     end,
     -- 发送到 telegram
     ["telegram"] = function(msg)

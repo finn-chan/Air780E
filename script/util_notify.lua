@@ -8,6 +8,23 @@ local msg_queue = {}
 local msg_count = 0
 local error_count = 0
 
+local function persistenceId(id, channel)
+    return id .. "-channel-" .. tostring(channel)
+end
+
+local function encodePersistedItem(item)
+    local ok, value = pcall(json.encode, {
+        notify_queue_v1 = true,
+        id = item.id,
+        channel = item.channel,
+        msg = item.msg,
+    })
+    if not ok or type(value) ~= "string" then
+        return nil
+    end
+    return value
+end
+
 --- 发送通知
 -- @param msg 消息内容
 -- @param channel 通知渠道
@@ -28,16 +45,26 @@ local function send(msg, channel)
     end
 
     -- 发送通知
-    local code, headers, body = util_notify_channel[channel](msg)
+    local code, headers, body, force_retry = util_notify_channel[channel](msg)
+    -- custom_post 等渠道可对 HTTP 2xx 继续执行自己的业务成功校验。
+    if force_retry then
+        log.error("util_notify.send", "发送通知失败, 等待重发", "code:", code)
+        return false
+    end
+    local log_body = channel == "custom_post" and "<已省略>" or body
     if code == nil then
-        log.info("util_notify.send", "发送通知失败, 无需重发", "code:", code, "body:", body)
+        log.info("util_notify.send", "发送通知失败, 无需重发", "code:", code, "body:", log_body)
         return true
     end
-    if code >= 200 and code < 500 and code ~= 408 and code ~= 409 and code ~= 425 and code ~= 429 then
-        log.info("util_notify.send", "发送通知成功", "code:", code, "body:", body)
+    if code >= 200 and code < 300 then
+        log.info("util_notify.send", "发送通知成功", "code:", code, "body:", log_body)
         return true
     end
-    log.error("util_notify.send", "发送通知失败, 等待重发", "code:", code, "body:", body)
+    if code >= 300 and code < 500 and code ~= 408 and code ~= 409 and code ~= 425 and code ~= 429 then
+        log.error("util_notify.send", "发送通知失败, 无需重发", "code:", code, "body:", log_body)
+        return true
+    end
+    log.error("util_notify.send", "发送通知失败, 等待重发", "code:", code, "body:", log_body)
     return false
 end
 
@@ -45,7 +72,8 @@ end
 -- @param msg 消息内容
 -- @param channels 通知渠道
 -- @param id 消息唯一标识
-function util_notify.add(msg, channels, id)
+-- @param persisted_id 已持久化消息的键，仅供恢复历史消息使用
+function util_notify.add(msg, channels, id, persisted_id)
     msg_count = msg_count + 1
 
     if id == nil or id == "" then
@@ -62,7 +90,13 @@ function util_notify.add(msg, channels, id)
     end
 
     for _, channel in ipairs(channels) do
-        table.insert(msg_queue, { id = id, channel = channel, msg = msg, retry = 0 })
+        table.insert(msg_queue, {
+            id = id,
+            persisted_id = persisted_id or persistenceId(id, channel),
+            channel = channel,
+            msg = msg,
+            retry = 0,
+        })
     end
     sys.publish("NEW_MSG")
     log.debug("util_notify.add", "添加到消息队列, 当前队列长度:", #msg_queue, "消息内容:", msg:gsub("\r", "\\r"):gsub("\n", "\\n"))
@@ -108,8 +142,8 @@ local function poll()
     if result then
         error_count = 0
         -- 检查 fskv 中如果存在则删除
-        if fskv.get(item.id) then
-            fskv.del(item.id)
+        if fskv.get(item.persisted_id) then
+            fskv.del(item.persisted_id)
         end
         return
     end
@@ -137,12 +171,17 @@ local function poll()
         if not (string.find(item.msg, "#SMS") or string.find(item.msg, "#CALL")) then
             return
         end
-        log.info("util_notify.poll", "当前第 1 次重发失败, 保存到 fskv", item.id)
-        if fskv.get(item.id) then
-            log.info("util_notify.poll", "fskv 已存在, 跳过写入", item.id)
+        log.info("util_notify.poll", "当前第 1 次重发失败, 保存到 fskv", item.persisted_id)
+        if fskv.get(item.persisted_id) then
+            log.info("util_notify.poll", "fskv 已存在, 跳过写入", item.persisted_id)
             return
         end
-        local kv_set_result = fskv.set(item.id, item.msg)
+        local persisted_value = encodePersistedItem(item)
+        if persisted_value == nil then
+            log.error("util_notify.poll", "持久化消息编码失败", item.persisted_id)
+            return
+        end
+        local kv_set_result = fskv.set(item.persisted_id, persisted_value)
         log.info("util_notify.poll", "fskv.set", kv_set_result, "used,total,count:", fskv.status())
     end
 end
@@ -165,11 +204,22 @@ sys.taskInit(function()
             break
         end
         local v = fskv.get(k)
-        if not (v and v ~= "" and string.find(k, "msg-")) then
-            break
+        if v and v ~= "" and string.find(k, "msg-", 1, true) then
+            local decode_ok, persisted_item = pcall(json.decode, v)
+            if decode_ok
+                and type(persisted_item) == "table"
+                and persisted_item.notify_queue_v1 == true
+                and type(persisted_item.id) == "string"
+                and type(persisted_item.channel) == "string"
+                and type(persisted_item.msg) == "string" then
+                log.info("util_notify", "检查到 fskv 中有历史消息", k)
+                util_notify.add(persisted_item.msg .. "\n#FSKV", persisted_item.channel, persisted_item.id, k)
+            else
+                -- 兼容旧版本直接保存消息正文的格式。
+                log.info("util_notify", "检查到旧格式 fskv 历史消息", k)
+                util_notify.add(v .. "\n#FSKV", nil, k, k)
+            end
         end
-        log.info("util_notify", "检查到 fskv 中有历史消息", k, v:gsub("\r", "\\r"):gsub("\n", "\\n"))
-        util_notify.add(v .. "\n#FSKV", nil, k)
     end
 end)
 

@@ -9,8 +9,16 @@ return {
     --
     -- custom_post 通知配置, 自定义 POST 请求, CUSTOM_POST_BODY_TABLE 中的 {msg} 会被替换为通知内容
     CUSTOM_POST_URL = "https://sctapi.ftqq.com/<SENDKEY>.send",
+    -- 可配置任意请求头；这里配置的 Content-Type 优先于 CUSTOM_POST_CONTENT_TYPE
+    CUSTOM_POST_HEADERS = {
+        -- ["Authorization"] = "Bearer <TOKEN>",
+        -- ["X-API-Key"] = "<API_KEY>",
+    },
+    -- 兼容旧配置；CUSTOM_POST_HEADERS 未提供 Content-Type 时使用此配置
     CUSTOM_POST_CONTENT_TYPE = "application/json",
     CUSTOM_POST_BODY_TABLE = { ["title"] = "这里是标题", ["desp"] = "这里是内容, 会被替换掉:\n{msg}\n{msg}" },
+    -- 可选；非空时，HTTP 2xx 的响应正文必须包含该关键字，否则按发送失败重试
+    CUSTOM_POST_SUCCESS_BODY_KEYWORD = "",
     --
     -- telegram 通知配置, https://github.com/0wQ/telegram-notify 或者自行反代
     TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage",
