@@ -68,6 +68,7 @@ util_netled = require "util_netled"
 util_mobile = require "util_mobile"
 util_location = require "util_location"
 util_notify = require "util_notify"
+util_sms_control = require "util_sms_control"
 
 -- 由于 NOTIFY_TYPE 支持多个配置, 需按照包含来判断
 local containsValue = function(t, value)
@@ -94,45 +95,92 @@ if containsValue(config.NOTIFY_TYPE, "serial") then
     end)
 end
 
--- 判断一个元素是否在一个表中
-local function isElementInTable(myTable, target)
-    for _, value in ipairs(myTable) do
-        if value == target then
-            return true
-        end
-    end
-    return false
-end
-
 -- 判断白名单号码是否符合触发短信控制的条件
 local function isWhiteListNumber(sender_number)
-    -- 判断如果未设置白名单号码, 禁止所有号码触发
-    if type(config.SMS_CONTROL_WHITELIST_NUMBERS) ~= "table" or #config.SMS_CONTROL_WHITELIST_NUMBERS == 0 then
-        return false
-    end
-    -- 已设置白名单号码, 判断是否在白名单中
-    return isElementInTable(config.SMS_CONTROL_WHITELIST_NUMBERS, sender_number)
+    return util_sms_control.isWhiteListNumber(config.SMS_CONTROL_WHITELIST_NUMBERS, sender_number)
 end
+
+local pending_sms_control = nil
+
+-- 新版固件会通过 SMS_SENT 返回真实发送结果；旧版固件不会触发此事件。
+sys.subscribe("SMS_SENT", function(result)
+    if not pending_sms_control then
+        return
+    end
+
+    local control = pending_sms_control
+    pending_sms_control = nil
+    local result_text = result and "成功" or "失败"
+    if result then
+        log.info("smsControl", "短信发送成功", control.receiver_number)
+    else
+        log.warn("smsControl", "短信发送失败", control.receiver_number)
+    end
+    util_notify.add({
+        "短信控制发送" .. result_text,
+        "目标号码: " .. control.receiver_number,
+        "控制号码: " .. control.sender_number,
+        "#SMS #CTRL_RESULT" .. (result and "" or " #CTRL_FAILED")
+    })
+end)
 
 -- 短信接收回调
 sms.setNewSmsCb(function(sender_number, sms_content, m)
-    local time = string.format("%d/%02d/%02d %02d:%02d:%02d", m.year + 2000, m.mon, m.day, m.hour, m.min, m.sec)
-    log.info("smsCallback", time, sender_number, sms_content)
+    local time = os.date("%Y-%m-%d %H:%M:%S")
+    if type(m) == "table"
+        and type(m.year) == "number"
+        and type(m.mon) == "number"
+        and type(m.day) == "number"
+        and type(m.hour) == "number"
+        and type(m.min) == "number"
+        and type(m.sec) == "number" then
+        time = string.format("%d/%02d/%02d %02d:%02d:%02d", m.year + 2000, m.mon, m.day, m.hour, m.min, m.sec)
+    end
+
+    sender_number = tostring(sender_number or "")
+    sms_content = tostring(sms_content or "")
+    local safe_sms_content = util_sms_control.redactToken(sms_content, config.SMS_CONTROL_TOKEN)
+    log.info("smsCallback", time, sender_number, safe_sms_content)
 
     -- 短信控制
     local is_sms_ctrl = false
+    local control_failed = false
+    local looks_like_control = util_sms_control.looksLikeCommand(sms_content)
     -- 判断发送者是否为白名单号码
     if isWhiteListNumber(sender_number) then
-        local receiver_number, sms_content_to_be_sent = sms_content:match("^SMS,(+?%d+),(.+)$")
-        receiver_number, sms_content_to_be_sent = receiver_number or "", sms_content_to_be_sent or ""
-        if sms_content_to_be_sent ~= "" and receiver_number ~= "" and #receiver_number >= 5 and #receiver_number <= 20 then
-            sms.send(receiver_number, sms_content_to_be_sent)
-            is_sms_ctrl = true
+        local receiver_number, sms_content_to_be_sent, parse_error =
+            util_sms_control.parseCommand(sms_content, config.SMS_CONTROL_TOKEN)
+
+        if receiver_number then
+            local accepted = sms.send(receiver_number, sms_content_to_be_sent)
+            if accepted then
+                is_sms_ctrl = true
+                pending_sms_control = {
+                    receiver_number = receiver_number,
+                    sender_number = sender_number
+                }
+                log.info("smsControl", "短信已进入发送队列", receiver_number)
+            else
+                control_failed = true
+                log.warn("smsControl", "短信发送请求被拒绝，短信模块可能繁忙或当前网络不支持", receiver_number)
+            end
+        elseif parse_error and looks_like_control then
+            control_failed = true
+            log.warn("smsControl", parse_error, sender_number)
         end
+    elseif looks_like_control then
+        log.warn("smsControl", "发送号码不在白名单中", sender_number,
+            util_sms_control.normalizePhoneNumber(sender_number) or "")
     end
 
     -- 发送通知
-    util_notify.add({ sms_content, "", "发件号码: " .. sender_number, "发件时间: " .. time, "#SMS" .. (is_sms_ctrl and " #CTRL" or "") })
+    util_notify.add({
+        safe_sms_content,
+        "",
+        "发件号码: " .. sender_number,
+        "发件时间: " .. time,
+        "#SMS" .. (is_sms_ctrl and " #CTRL" or "") .. (control_failed and " #CTRL_FAILED" or "")
+    })
 end)
 
 sys.taskInit(function()

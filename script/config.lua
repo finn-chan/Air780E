@@ -108,6 +108,11 @@ return {
     --
     -- 短信控制白名单号码, 为空或注释掉, 表示禁止所有号码
     -- 短信格式示例: SMS,10086,查询流量
-    -- 配置示例: SMS_CONTROL_WHITELIST_NUMBERS = { "18xxxxxxx", "18xxxxxxx", "18xxxxxxx" }
+    -- 配置示例: SMS_CONTROL_WHITELIST_NUMBERS = { "+8618xxxxxxx", "+8618xxxxxxx" }
+    -- 支持自动兼容 +86、86、0086 和国内 11 位手机号格式
     SMS_CONTROL_WHITELIST_NUMBERS = {},
+    --
+    -- 可选短信控制口令。配置后短信格式为: 口令,SMS,10086,查询流量
+    -- 口令不能包含英文逗号；留空表示保持原短信格式，不校验口令
+    SMS_CONTROL_TOKEN = "",
 }
